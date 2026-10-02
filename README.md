@@ -34,4 +34,8 @@ Add it under: **Settings → Secrets and variables → Actions → New repositor
 ## Signing status
 
 Builds are ad-hoc signed and **not notarized** (no Apple Developer ID). This prevents the
-"app is damaged" failure but leaves a one-time right-click → Open approval on first launch.
+"app is damaged" failure, but Gatekeeper still shows a one-time first-launch prompt. On
+macOS 15/26 that prompt is cleared in **System Settings → Privacy & Security → Open
+Anyway**; Apple removed the older right-click → Open shortcut. See the release notes
+for the full steps. Only a paid Apple Developer ID + notarization removes the prompt
+entirely.
