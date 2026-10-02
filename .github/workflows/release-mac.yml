@@ -1,0 +1,166 @@
+name: Release Mac
+
+# Builds the signed .app / .dmg from the private source repo and publishes it as
+# a public GitHub Release here.
+#
+# This repo intentionally holds NO application code — it is the public download
+# surface only. The build pulls source from healthfirst-ind/Apple-Client, which
+# is private, so the cross-repo checkout needs a PAT in SOURCE_TOKEN. The
+# built-in GITHUB_TOKEN is scoped to this repo and cannot read Apple-Client.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, e.g. 1.2.3 (tag v1.2.3 is used)"
+        required: true
+        type: string
+      source_ref:
+        description: "Branch/tag/commit in Apple-Client to build"
+        required: false
+        default: main
+        type: string
+
+# Serialise runs per version. A tag created by the release action can re-trigger
+# this workflow; without this, two runs would race to publish the same release.
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  # We ship without an Apple Developer ID. This skips electron-builder's own
+  # signing path so tools/after-pack.cjs has sole ownership of codesign and
+  # ad-hoc signs the assembled .app (required on Apple Silicon, otherwise
+  # Gatekeeper reports "is damaged and can't be opened").
+  CSC_IDENTITY_AUTO_DISCOVERY: "false"
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - name: Resolve release version
+        id: ver
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="${GITHUB_REF_NAME#v}"
+          fi
+          case "$v" in
+            ''|*[!0-9.]*) echo "::error::Invalid version '$v' (expected digits and dots)"; exit 1 ;;
+          esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "::notice::Releasing v$v"
+
+      - name: Check for an existing release
+        id: exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: v${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release $TAG already exists — nothing to do."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout this repo (release notes)
+        uses: actions/checkout@v4
+        with:
+          path: meta
+
+      - name: Checkout source
+        # Apple-Client holds the app. The tag lives in THIS repo, not in the
+        # source repo, so the source is always built from a ref the caller names
+        # (main by default) rather than from a same-named tag upstream.
+        uses: actions/checkout@v4
+        with:
+          repository: healthfirst-ind/Apple-Client
+          token: ${{ secrets.SOURCE_TOKEN }}
+          ref: ${{ inputs.source_ref || github.event.inputs.source_ref || 'main' }}
+          path: source
+
+      - name: Verify source checkout
+        run: |
+          set -euo pipefail
+          if [ ! -f source/package.json ]; then
+            echo "::error::No package.json under source/ — check SOURCE_TOKEN has access to Apple-Client."
+            exit 1
+          fi
+          echo "Building from: $(cd source && git rev-parse --short HEAD) ($(cd source && git rev-parse --abbrev-ref HEAD))"
+
+      - name: Set up Node
+        working-directory: source
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install deps
+        working-directory: source
+        run: npm ci
+
+      - name: Pin app version to the release tag
+        # Makes a v1.2.3 tag produce "...-1.2.3-arm64.dmg" even when package.json
+        # still says 0.1.0. Build-time only — never committed back.
+        working-directory: source
+        env:
+          APP_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            console.log(`version ${p.version} -> ${process.env.APP_VERSION}`);
+            p.version = process.env.APP_VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          '
+
+      - name: Make icon.icns (macOS only tools)
+        # assets/icon.icns is gitignored, so it must be generated on the runner.
+        working-directory: source
+        run: bash tools/make-icns.sh
+
+      - name: Run tests
+        working-directory: source
+        run: npm test --if-present
+
+      - name: Build Mac DMG (arm64, ad-hoc signed)
+        working-directory: source
+        run: npx electron-builder --mac --arm64 --publish never
+
+      - name: Verify signature (fail build if unsealed)
+        working-directory: source
+        run: |
+          set -euo pipefail
+          APP="$(find dist -maxdepth 2 -name 'IndiaMart Automation Tool.app' -type d | head -1)"
+          test -n "$APP"
+          codesign --verify --deep --strict "$APP"
+          codesign -dvvv "$APP" 2>&1 | grep -E "Signature=|Identifier="
+
+      - name: Upload DMGs
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: |
+            source/dist/*.dmg
+            source/dist/*.zip
+
+      - name: Publish release
+        if: steps.exists.outputs.found == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: IndiaMart Automation Tool v${{ steps.ver.outputs.version }}
+          body_path: meta/.github/release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            source/dist/*.dmg
+            source/dist/*.zip
