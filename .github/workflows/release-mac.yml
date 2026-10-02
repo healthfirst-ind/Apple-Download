@@ -97,11 +97,13 @@ jobs:
           echo "Building from: $(cd source && git rev-parse --short HEAD) ($(cd source && git rev-parse --abbrev-ref HEAD))"
 
       - name: Set up Node
-        working-directory: source
+        # cache-dependency-path must point at the source checkout, since that is
+        # where package-lock.json lives (this repo holds no npm project).
         uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
+          cache-dependency-path: source/package-lock.json
 
       - name: Install deps
         working-directory: source
